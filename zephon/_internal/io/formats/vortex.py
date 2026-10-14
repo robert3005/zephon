@@ -3,13 +3,17 @@
 
 """Vortex shard discovery and indexed sample reads."""
 
+import inspect
+import os
 import posixpath
+import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping
 
 import numpy as np
 
@@ -39,6 +43,28 @@ try:
     import vortex as _vortex
 except ImportError:
     _vortex = None
+
+
+def _accepts(function: Callable[..., Any], parameter: str) -> bool:
+    """Return True when ``function`` has a parameter named ``parameter``."""
+    try:
+        return parameter in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+# Newer Vortex scans export to Arrow directly, which releases the GIL only once.
+_SCAN_EXPORTS_ARROW = _vortex is not None and hasattr(
+    _vortex.ArrayIterator, "to_arrow_array"
+)
+
+# Newer Vortex maps local files into memory. Reads then use no IO threads and
+# no copies, and the page cache takes the place of the segment cache.
+_OPENS_MAPPED_FILES = _vortex is not None and _accepts(_vortex.open, "memory_map")
+
+# Mapped files that each store keeps open between batches. An evicted cached
+# shard keeps its disk space while it is mapped, so the bound stays small.
+_MAX_MAPPED_FILES = 64
 
 
 def _require_vortex() -> ModuleType:
@@ -102,19 +128,74 @@ class _VortexMetadata:
     text_only: bool
 
 
+class _MappedFiles:
+    """Memory-mapped Vortex files that stay open between batches.
+
+    Shards are opened again for each batch. Mapping a file again costs an open,
+    a map, page faults and an unmap, which is more than a small read. Each
+    lookup checks the file's identity with ``stat``: a replaced file, such as a
+    shard that the cache downloaded again, is mapped again, and a removed file
+    is dropped and its ``FileNotFoundError`` raised. A file that is removed and
+    not read again keeps its disk space until it is evicted from this LRU.
+    """
+
+    def __init__(self, max_files: int) -> None:
+        self._max_files = max_files
+        self._files: OrderedDict[str, tuple[tuple[int, int, int, int], Any]] = (
+            OrderedDict()
+        )
+        self._lock = threading.Lock()
+
+    def get_or_open(self, path: Path, open_file: Callable[[], Any]) -> Any:
+        """Return the open file at ``path``, opening it when it is new or changed."""
+        key = str(path)
+        try:
+            stats = os.stat(key)
+        except OSError:
+            with self._lock:
+                self._files.pop(key, None)
+            raise
+        identity = (stats.st_dev, stats.st_ino, stats.st_size, stats.st_mtime_ns)
+
+        with self._lock:
+            entry = self._files.get(key)
+            if entry is not None and entry[0] == identity:
+                self._files.move_to_end(key)
+                return entry[1]
+
+        # Opening does IO, so it runs outside the lock. A replaced entry is
+        # unmapped once the reads that still use it finish.
+        file = open_file()
+        with self._lock:
+            self._files[key] = (identity, file)
+            self._files.move_to_end(key)
+            while len(self._files) > self._max_files:
+                self._files.popitem(last=False)
+        return file
+
+    def clear(self) -> None:
+        """Drop every open file."""
+        with self._lock:
+            self._files.clear()
+
+
 def _open_vortex_file(
     path: Path,
     metadata_cache: MetadataCache[str, _VortexMetadata],
     segment_cache: Any | None,
+    mapped_files: _MappedFiles | None = None,
 ) -> tuple[Any, _VortexMetadata]:
-    """Open a reader using the store's footer and segment caches."""
+    """Open a reader using the store's footer, segment and open-file caches."""
     vortex = _require_vortex()
     key = file_cache_key(path)
-    options: dict[str, Any] = (
-        {"segment_cache": segment_cache, "cache_key": key}
-        if segment_cache is not None
-        else {"without_segment_cache": True}
-    )
+    options: dict[str, Any]
+    if _OPENS_MAPPED_FILES:
+        # The page cache serves a mapped file, so it needs no segment cache.
+        options = {"memory_map": True}
+    elif segment_cache is not None:
+        options = {"segment_cache": segment_cache, "cache_key": key}
+    else:
+        options = {"without_segment_cache": True}
     file = None
 
     def load_metadata() -> _VortexMetadata:
@@ -134,10 +215,16 @@ def _open_vortex_file(
         return _VortexMetadata(file.footer, export_type, text_only)
 
     metadata = metadata_cache.get_or_load(key, load_metadata)
-    # Reuse the reader opened on a footer-cache miss.
-    if file is None:
-        file = vortex.open(str(path), footer=metadata.footer, **options)
-    return file, metadata
+
+    def open_file() -> Any:
+        # Reuse the reader opened on a footer-cache miss.
+        if file is not None:
+            return file
+        return vortex.open(str(path), footer=metadata.footer, **options)
+
+    if mapped_files is not None:
+        return mapped_files.get_or_open(path, open_file), metadata
+    return open_file(), metadata
 
 
 @contextmanager
@@ -164,13 +251,14 @@ class VortexShard(RandomAccessShard):
         length: int | None = None,
         metadata_cache: MetadataCache[str, _VortexMetadata] | None = None,
         segment_cache: Any | None = None,
+        mapped_files: _MappedFiles | None = None,
     ) -> None:
         self._path = path
         if metadata_cache is None:
             metadata_cache = MetadataCache(0)
         with _local_io_errors(path):
             self._file, metadata = _open_vortex_file(
-                path, metadata_cache, segment_cache
+                path, metadata_cache, segment_cache, mapped_files
             )
         self._length = length if length is not None else len(self._file)
         self._export_type = metadata.export_type
@@ -219,10 +307,11 @@ class VortexShard(RandomAccessShard):
             # TODO(MaxiBoether): Follow up upstream on retained-reader point-read
             # setup costs. Reproduction and baseline live in
             # our internal dataloader arena.
-            batch = self._file.scan(
-                indices=_require_vortex().array(selected)
-            ).read_all()
+            scan = self._file.scan(indices=_require_vortex().array(selected))
+
             if self._text_only and len(sorted_unique) == 1:
+                batch = scan.read_all()
+
                 # Scalar access avoids exporting a whole string dictionary.
                 row = batch.scalar_at(0).as_py()
                 if row is not None:
@@ -232,8 +321,20 @@ class VortexShard(RandomAccessShard):
                 # Null structs need Arrow's per-field null conversion.
                 # Vortex 0.88's writer rejects nullable root structs; keep this
                 # guard for native arrays supplied by other readers or writers.
-            # ListView export can trim unselected child values before decoding.
-            arrow_array = batch.to_arrow_array(arrow_type=self._export_type)
+                arrow_array = batch.to_arrow_array(arrow_type=self._export_type)
+            elif _SCAN_EXPORTS_ARROW:
+                # One GIL release covers both the read and the export. Scattered
+                # rows come from many Vortex chunks, a few rows each, so one
+                # combined array costs less than an Arrow export per chunk.
+                # Contiguous rows keep their chunks, which avoids a copy.
+                arrow_array = scan.to_arrow_array(
+                    arrow_type=self._export_type, combine_chunks=not contiguous
+                )
+            else:
+                # ListView export can trim unselected child values before decoding.
+                arrow_array = scan.read_all().to_arrow_array(
+                    arrow_type=self._export_type
+                )
         return arrow_array_to_samples(arrow_array, positions)
 
 
@@ -281,8 +382,13 @@ class VortexShardOpener:
         )
         self._segment_cache = (
             vortex.SegmentCache(options.vortex.segment_cache_bytes)
-            if options.vortex.segment_cache_bytes
+            if options.vortex.segment_cache_bytes and not _OPENS_MAPPED_FILES
             else None
+        )
+
+        max_files = min(options.metadata_cache_entries, _MAX_MAPPED_FILES)
+        self._mapped_files = (
+            _MappedFiles(max_files) if _OPENS_MAPPED_FILES and max_files else None
         )
 
     def open_shard(
@@ -294,13 +400,16 @@ class VortexShardOpener:
             length=_shard_length(local_ref),
             metadata_cache=self._metadata_cache,
             segment_cache=self._segment_cache,
+            mapped_files=self._mapped_files,
         )
 
     def close(self) -> None:
-        """Clear the store's Vortex caches."""
+        """Clear the store's Vortex caches and close its open files."""
         self._metadata_cache.clear()
         if self._segment_cache is not None:
             self._segment_cache.clear()
+        if self._mapped_files is not None:
+            self._mapped_files.clear()
 
 
 class VortexFormat(FormatHandler):

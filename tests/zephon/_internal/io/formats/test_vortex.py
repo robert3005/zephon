@@ -26,6 +26,7 @@ from zephon._internal.io.formats.vortex import (
     VortexShard,
     VortexShardOpener,
     _list_view_type,
+    _MappedFiles,
 )
 from zephon._internal.io.storage import StorageBackend
 from zephon._internal.io.storage.local import LocalFSBackend
@@ -807,6 +808,8 @@ def test_opener_retains_only_enabled_caches(
     pa: Any,
 ) -> None:
     """Cache options control footer/schema reuse and native segment arguments."""
+    # Segment caches apply to file reads; memory-mapped reads are tested below.
+    monkeypatch.setattr(vortex_format, "_OPENS_MAPPED_FILES", False)
     to_arrow_type = mock.Mock(return_value=pa.struct([("value", pa.int64())]))
     native_open = mock.Mock(
         side_effect=lambda *_args, **_kwargs: SimpleNamespace(
@@ -865,3 +868,99 @@ def test_opener_retains_only_enabled_caches(
         opener.close()
     if segment_bytes:
         segment_cache.clear.assert_called_once_with()
+
+
+def test_mapped_files_reuse_an_unchanged_file(tmp_path: Path) -> None:
+    path = tmp_path / "a.vortex"
+    path.write_bytes(b"one")
+    files = _MappedFiles(4)
+    opened: list[object] = []
+
+    def open_file() -> object:
+        opened.append(object())
+        return opened[-1]
+
+    first = files.get_or_open(path, open_file)
+    assert files.get_or_open(path, open_file) is first
+    assert len(opened) == 1
+
+
+def test_mapped_files_reopen_a_replaced_file(tmp_path: Path) -> None:
+    path = tmp_path / "a.vortex"
+    path.write_bytes(b"one")
+    files = _MappedFiles(4)
+    first = files.get_or_open(path, object)
+
+    # The shard cache installs a new download with a rename, as here.
+    replacement = tmp_path / "a.vortex.tmp"
+    replacement.write_bytes(b"other")
+    replacement.replace(path)
+
+    assert files.get_or_open(path, object) is not first
+
+
+def test_mapped_files_drop_a_removed_file(tmp_path: Path) -> None:
+    path = tmp_path / "a.vortex"
+    path.write_bytes(b"one")
+    files = _MappedFiles(4)
+    files.get_or_open(path, object)
+
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        files.get_or_open(path, object)
+
+    # The mapping of the removed file is released, not kept for a later read.
+    assert str(path) not in files._files
+
+
+def test_mapped_files_keep_at_most_max_files(tmp_path: Path) -> None:
+    files = _MappedFiles(2)
+    paths = []
+    for name in ("a", "b", "c"):
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        paths.append(path)
+        files.get_or_open(path, object)
+
+    assert list(files._files) == [str(paths[1]), str(paths[2])]
+
+
+def test_opener_keeps_mapped_files_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pa: Any
+) -> None:
+    """A Vortex with memory maps opens each shard once and uses no segment cache."""
+    monkeypatch.setattr(vortex_format, "_OPENS_MAPPED_FILES", True)
+    to_arrow_type = mock.Mock(return_value=pa.struct([("value", pa.int64())]))
+    native_open = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: SimpleNamespace(
+            footer=object(), dtype=SimpleNamespace(to_arrow_type=to_arrow_type)
+        )
+    )
+    make_cache = mock.Mock()
+    monkeypatch.setattr(
+        vortex_format,
+        "_require_vortex",
+        lambda: SimpleNamespace(
+            open=native_open, SegmentCache=make_cache, set_worker_threads=mock.Mock()
+        ),
+    )
+    opener = VortexShardOpener(StoreOptions())
+    path = tmp_path / "a.vortex"
+    path.write_bytes(b"data")
+    locator = ShardLocator(
+        dataset="test",
+        shard_id=0,
+        format="vortex",
+        root=str(tmp_path),
+        raw=ShardFile(basename="a.vortex", bytes=4, hashes={}),
+    )
+    ref = LocalShardRef(raw=LocalShardFile(path=path, bytes=4), extra={"length": 1})
+
+    try:
+        shards = [opener.open_shard(locator, ref) for _ in range(3)]
+        assert shards[0]._file is shards[1]._file is shards[2]._file
+        native_open.assert_called_once()
+        assert native_open.call_args.kwargs == {"memory_map": True}
+        make_cache.assert_not_called()
+    finally:
+        opener.close()

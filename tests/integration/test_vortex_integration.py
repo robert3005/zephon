@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import pytest
 
+from zephon._internal.io.formats import vortex as vortex_format
+
 pytest.importorskip("vortex.io", reason="vortex-data not installed")
 import vortex
 
@@ -85,6 +87,8 @@ def test_store_reuses_caches_across_fetch_groups(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Segment caches apply to file reads; memory-mapped reads are tested below.
+    monkeypatch.setattr(vortex_format, "_OPENS_MAPPED_FILES", False)
     datasets = {}
     for dataset_id in (0, 1):
         root = tmp_path / str(dataset_id)
@@ -136,6 +140,56 @@ def test_store_reuses_caches_across_fetch_groups(
     finally:
         store.close()
     assert calls[0]["segment_cache"].size_bytes == 0
+
+
+@pytest.mark.skipif(
+    not vortex_format._OPENS_MAPPED_FILES, reason="Vortex without memory_map"
+)
+def test_store_keeps_mapped_files_open_until_they_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "0"
+    root.mkdir()
+    _write(root / "data.vortex", 0)
+    datasets = {0: Dataset.from_path("0", str(root), fmt="vortex")}
+    calls: list[dict[str, Any]] = []
+    paths: list[Path] = []
+    native_open = vortex.open
+
+    def record_open(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        paths.append(Path(args[0]))
+        return native_open(*args, **kwargs)
+
+    monkeypatch.setattr(vortex, "open", record_open)
+    store = build_multi_dataset_store(
+        datasets,
+        options=StoreOptions(
+            cache=CacheOptions(enabled=True, root=tmp_path / "cache"),
+            metadata_cache_entries=2,
+        ),
+    )
+    try:
+        shard, _ = store.for_dataset(0).open(0)
+        for _ in range(3):
+            rows, _ = shard.getsamples([2, 0, 2])
+            assert rows == [{"value": index} for index in (2, 0, 2)]
+        assert len(calls) == 1  # The mapped file stays open between reads.
+
+        # A new download of the shard is a new file, so it is mapped again.
+        path = paths[-1]
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(path.read_bytes())
+        replacement.replace(path)
+        rows, _ = shard.getsamples([1])
+        assert rows == [{"value": 1}]
+
+        assert len(calls) == 2
+        assert all(call.get("memory_map") for call in calls)
+        assert ["footer" in call for call in calls] == [False, True]
+    finally:
+        store.close()
 
 
 def test_native_open_eviction_is_retried(
